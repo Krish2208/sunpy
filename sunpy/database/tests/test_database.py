@@ -17,8 +17,7 @@ from astropy import units
 from astropy.utils.exceptions import AstropyUserWarning
 
 import sunpy
-import sunpy.data.test
-from sunpy.data.test.waveunit import waveunitdir
+from sunpy.data.test import get_test_filepath
 from sunpy.database import (
     Database,
     EntryAlreadyAddedError,
@@ -40,16 +39,7 @@ from sunpy.net import Fido
 from sunpy.net import attrs as net_attrs
 from sunpy.net import hek, vso
 
-testpath = sunpy.data.test.rootdir
-RHESSI_IMAGE = os.path.join(testpath, 'hsi_image_20101016_191218.fits')
-
-
-"""
-The 'hsi_image_20101016_191218.fits' file lies in the sunpy/data/test.
-RHESSI_IMAGE  = sunpy/data/test/hsi_image_20101016_191218.fits
-
-So, the tests in the database depends on the test under sunpy/data.
-"""
+RHESSI_IMAGE = get_test_filepath('hsi_image_20101016_191218.fits')
 
 
 @pytest.fixture
@@ -295,9 +285,11 @@ def test_tag_undo(database):
     assert len(entry.tags) == 1
 
 
-def remove_nonexisting_tag(database):
+def test_remove_nonexisting_tag(database):
+    entry = DatabaseEntry()
+    database.add(entry)
     with pytest.raises(NoSuchTagError):
-        database.remove_tag('foo')
+        database.remove_tag(entry, 'foo')
 
 
 def test_remove_tag(filled_database):
@@ -367,7 +359,7 @@ def test_star_undo(database):
     assert entry.starred
 
 
-def unstar_entry(database):
+def test_unstar_entry(database):
     entry = DatabaseEntry()
     assert not entry.starred
     database.star(entry)
@@ -443,6 +435,7 @@ def test_add_already_existing_entry_ignore(database):
 
 
 @pytest.mark.remote_data
+@pytest.mark.skip
 def test_add_entry_from_hek_qr(database):
     hek_res = hek.HEKClient().search(
         net_attrs.Time('2020/08/09 07:23:56', '2020/08/09 08:23:56'),
@@ -463,6 +456,7 @@ def num_entries_from_vso_query(db, query, path=None, file_pattern='',
 
 
 @pytest.mark.remote_data
+@pytest.mark.skip
 def test_vso_query_block_caching(database, download_qr, tmpdir):
 
     assert len(database) == 0
@@ -504,6 +498,7 @@ def test_vso_query_block_caching(database, download_qr, tmpdir):
 
 
 @pytest.mark.remote_data
+@pytest.mark.skip
 def test_vso_query_block_caching_with_overwrite_true_flag(database,
                                                           download_qr, tmpdir):
 
@@ -532,6 +527,7 @@ def test_vso_query_block_caching_with_overwrite_true_flag(database,
 
 
 @pytest.mark.remote_data
+@pytest.mark.skip
 def test_download_from_qr(database, download_qr, tmpdir):
     assert len(database) == 0
     database.download_from_vso_query_result(
@@ -549,6 +545,7 @@ def test_download_from_qr(database, download_qr, tmpdir):
 
 
 @pytest.mark.remote_data
+@pytest.mark.skip
 def test_add_entry_from_qr(database, query_result):
     assert len(database) == 0
     database.add_from_vso_query_result(query_result)
@@ -560,6 +557,7 @@ def test_add_entry_from_qr(database, query_result):
 
 
 @pytest.mark.remote_data
+@pytest.mark.skip
 def test_add_entries_from_qr_duplicates(database, query_result):
     assert len(database) == 0
     database.add_from_vso_query_result(query_result)
@@ -569,6 +567,7 @@ def test_add_entries_from_qr_duplicates(database, query_result):
 
 
 @pytest.mark.remote_data
+@pytest.mark.skip
 def test_add_entries_from_qr_ignore_duplicates(database, query_result):
     assert len(database) == 0
     database.add_from_vso_query_result(query_result)
@@ -578,6 +577,7 @@ def test_add_entries_from_qr_ignore_duplicates(database, query_result):
 
 
 @pytest.mark.remote_data
+@pytest.mark.skip
 def test_add_entry_fido_search_result(database, fido_search_result):
     assert len(database) == 0
     database.add_from_fido_search_result(fido_search_result)
@@ -589,6 +589,7 @@ def test_add_entry_fido_search_result(database, fido_search_result):
 
 
 @pytest.mark.remote_data
+@pytest.mark.skip
 def test_add_entries_from_fido_search_result_JSOC_client(database):
     assert len(database) == 0
     search_result = Fido.search(
@@ -601,6 +602,7 @@ def test_add_entries_from_fido_search_result_JSOC_client(database):
 
 
 @pytest.mark.remote_data
+@pytest.mark.skip
 def test_add_entries_from_fido_search_result_duplicates(database, fido_search_result):
     assert len(database) == 0
     database.add_from_fido_search_result(fido_search_result)
@@ -610,6 +612,7 @@ def test_add_entries_from_fido_search_result_duplicates(database, fido_search_re
 
 
 @pytest.mark.remote_data
+@pytest.mark.skip
 def test_add_entries_from_fido_search_result_ignore_duplicates(database, fido_search_result):
     assert len(database) == 0
     database.add_from_fido_search_result(fido_search_result)
@@ -618,10 +621,9 @@ def test_add_entries_from_fido_search_result_ignore_duplicates(database, fido_se
     assert len(database) == 2*35
 
 
-def test_add_fom_path(database):
+def test_add_fom_path(database, waveunit_fits_directory):
     assert len(database) == 0
-    with pytest.warns(AstropyUserWarning, match='File may have been truncated'):
-        database.add_from_dir(waveunitdir)
+    database.add_from_dir(waveunit_fits_directory)
     assert len(database) == 4
     database.undo()
     assert len(database) == 0
@@ -629,20 +631,17 @@ def test_add_fom_path(database):
     assert len(database) == 4
 
 
-def test_add_fom_path_duplicates(database):
-    with pytest.warns(AstropyUserWarning, match='File may have been truncated'):
-        database.add_from_dir(waveunitdir)
+def test_add_fom_path_duplicates(database, waveunit_fits_directory):
+    database.add_from_dir(waveunit_fits_directory)
     assert len(database) == 4
     with pytest.raises(EntryAlreadyAddedError), pytest.warns(AstropyUserWarning, match='File may have been truncated'):
-        database.add_from_dir(waveunitdir)
+        database.add_from_dir(waveunit_fits_directory)
 
 
-def test_add_fom_path_ignore_duplicates(database):
-    with pytest.warns(AstropyUserWarning, match='File may have been truncated'):
-        database.add_from_dir(waveunitdir)
+def test_add_fom_path_ignore_duplicates(database, waveunit_fits_directory):
+    database.add_from_dir(waveunit_fits_directory)
     assert len(database) == 4
-    with pytest.warns(AstropyUserWarning, match='File may have been truncated'):
-        database.add_from_dir(waveunitdir, ignore_already_added=True)
+    database.add_from_dir(waveunit_fits_directory, ignore_already_added=True)
     assert len(database) == 8
 
 
@@ -890,6 +889,7 @@ def test_fetch_missing_arg(database):
 
 
 @pytest.mark.remote_data
+@pytest.mark.skip
 def test_fetch_empty_query_result(database, empty_query):
     database.fetch(*empty_query)
     with pytest.raises(EmptyCommandStackError):
@@ -898,6 +898,7 @@ def test_fetch_empty_query_result(database, empty_query):
 
 
 @pytest.mark.remote_data
+@pytest.mark.skip
 def test_fetch(database, download_query, tmpdir):
     assert len(database) == 0
     database.default_waveunit = 'angstrom'
@@ -917,6 +918,7 @@ def test_fetch(database, download_query, tmpdir):
 
 
 @pytest.mark.remote_data
+@pytest.mark.skip
 def test_fetch_duplicates(database, download_query, tmpdir):
     assert len(database) == 0
     database.default_waveunit = 'angstrom'
@@ -944,6 +946,7 @@ def test_fetch_missing_arg(database):
 
 
 @pytest.mark.remote_data
+@pytest.mark.skip
 def test_fetch(database, download_query, tmpdir):
     assert len(database) == 0
     database.default_waveunit = 'angstrom'
@@ -956,6 +959,7 @@ def test_fetch(database, download_query, tmpdir):
 
 
 @pytest.mark.remote_data
+@pytest.mark.skip
 def test_fetch_separate_filenames():
     # Setup
     db = Database('sqlite:///')
@@ -993,6 +997,7 @@ def test_fetch_separate_filenames():
 
 
 @pytest.mark.remote_data
+@pytest.mark.skip
 def test_fetch_partial_download(mocker, database, download_query, tmpdir):
     results = Results()
     results.append("successful_download.fits")
@@ -1009,6 +1014,7 @@ def test_fetch_partial_download(mocker, database, download_query, tmpdir):
 
 
 @pytest.mark.remote_data
+@pytest.mark.skip
 def test_disable_undo(database, download_query, tmpdir):
     entry = DatabaseEntry()
     with disable_undo(database) as db:

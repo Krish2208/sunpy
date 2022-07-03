@@ -9,8 +9,6 @@ import numbers
 import textwrap
 import itertools
 import webbrowser
-from io import BytesIO
-from base64 import b64encode
 from tempfile import NamedTemporaryFile
 from collections import namedtuple
 
@@ -19,6 +17,12 @@ import numpy as np
 from matplotlib import cm
 from matplotlib.backend_bases import FigureCanvasBase
 from matplotlib.figure import Figure
+
+try:
+    from dask.array import Array as DaskArray
+    DASK_INSTALLED = True
+except ImportError:
+    DASK_INSTALLED = False
 
 import astropy.units as u
 import astropy.wcs
@@ -38,12 +42,19 @@ from sunpy.coordinates import HeliographicCarrington, get_earth, sun
 from sunpy.coordinates.utils import get_rectangle_coordinates
 from sunpy.image.resample import resample as sunpy_image_resample
 from sunpy.image.resample import reshape_image_to_4d_superpixel
+from sunpy.image.transform import _get_transform_method, _rotation_function_names, affine_transform
 from sunpy.sun import constants
 from sunpy.time import is_time, parse_time
 from sunpy.util import MetaDict, expand_list
-from sunpy.util.decorators import cached_property_based_on, check_arithmetic_compatibility
-from sunpy.util.exceptions import warn_metadata, warn_user
+from sunpy.util.decorators import (
+    add_common_docstring,
+    cached_property_based_on,
+    check_arithmetic_compatibility,
+    deprecated,
+)
+from sunpy.util.exceptions import warn_deprecated, warn_metadata, warn_user
 from sunpy.util.functools import seconddispatch
+from sunpy.util.util import _figure_to_base64
 from sunpy.visualization import axis_labels_from_ctype, peek_show, wcsaxes_compat
 from sunpy.visualization.colormaps import cm as sunpy_cm
 
@@ -296,7 +307,7 @@ class GenericMap(NDData):
     def __repr__(self):
         return f"{object.__repr__(self)}\n{self}"
 
-    def _repr_html_(self):
+    def _repr_html_(self, compute_dask=False):
         """
         Produce an HTML summary with plots for use in Jupyter notebooks.
         """
@@ -312,6 +323,25 @@ class GenericMap(NDData):
         finite_data = self.data[np.isfinite(self.data)]
         count_nan = np.isnan(self.data).sum()
         count_inf = np.isinf(self.data).sum()
+
+        if DASK_INSTALLED and isinstance(finite_data, DaskArray):
+            # This will fetch the entire data array into memory and only happens for the quicklook method
+            if compute_dask:
+                finite_data = finite_data.compute()
+            else:
+                dask_html = self.data._repr_html_()
+                return textwrap.dedent(f"""\
+                    <pre>{html.escape(object.__repr__(self))}</pre>
+                    <table>
+                        <tr>
+                            <td>{text_to_table}</td>
+                            <td>
+                                {dask_html}
+                            </td>
+                        </tr>
+                        <tr>
+                        </tr>
+                    </table>""")
 
         # Assemble an informational string with the counts of bad pixels
         bad_pixel_text = ""
@@ -467,7 +497,7 @@ class GenericMap(NDData):
             f.write(textwrap.dedent(f"""\
                 <html>
                     <title>Quicklook summary for {html.escape(object.__repr__(self))}</title>
-                    <body>{self._repr_html_()}</body>
+                    <body>{self._repr_html_(compute_dask=True)}</body>
                 </html>"""))
         webbrowser.open_new_tab(url)
 
@@ -667,32 +697,31 @@ class GenericMap(NDData):
 
     def std(self, *args, **kwargs):
         """
-        Calculate the standard deviation of the data array.
+        Calculate the standard deviation of the data array, ignoring NaNs.
         """
-        return self.data.std(*args, **kwargs)
+        return np.nanstd(self.data, *args, **kwargs)
 
     def mean(self, *args, **kwargs):
         """
-        Calculate the mean of the data array.
+        Calculate the mean of the data array, ignoring NaNs.
         """
-        return self.data.mean(*args, **kwargs)
+        return np.nanmean(self.data, *args, **kwargs)
 
     def min(self, *args, **kwargs):
         """
-        Calculate the minimum value of the data array.
+        Calculate the minimum value of the data array, ignoring NaNs.
         """
-        return self.data.min(*args, **kwargs)
+        return np.nanmin(self.data, *args, **kwargs)
 
     def max(self, *args, **kwargs):
         """
-        Calculate the maximum value of the data array.
+        Calculate the maximum value of the data array, ignoring NaNs.
         """
-        return self.data.max(*args, **kwargs)
+        return np.nanmax(self.data, *args, **kwargs)
 
     @staticmethod
     def _parse_fits_unit(unit_str):
         replacements = {'gauss': 'G',
-                        'mx/cm^2': 'G',
                         'dn': 'ct',
                         'dn/s': 'ct/s'}
         if unit_str.lower() in replacements:
@@ -982,15 +1011,32 @@ class GenericMap(NDData):
     def shifted_value(self):
         """The total shift applied to the reference coordinate by past applications of
         `~sunpy.map.GenericMap.shift`."""
+        warn_deprecated(
+            '`sunpy.map.GenericMap.shifted_value` is deprecated and will be removed in sunpy 4.1. '
+            'Use ``sunpy.map.GenericMap.meta.modified_items`` to see how the '
+            'reference coordinate has been modified.'
+        )
         return self._shift
 
+    @deprecated('4.0', alternative='`sunpy.map.GenericMap.shift_reference_coord`')
     @u.quantity_input
     def shift(self, axis1: u.deg, axis2: u.deg):
+        # Note that the doc redirection for this method is at the end of the file.
+
+        new_map = self.shift_reference_coord(axis1, axis2)
+        new_map._shift = SpatialPair(self.shifted_value[0] + axis1,
+                                     self.shifted_value[1] + axis2)
+        return new_map
+
+    @u.quantity_input
+    def shift_reference_coord(self, axis1: u.deg, axis2: u.deg):
         """
         Returns a map shifted by a specified amount to, for example, correct
         for a bad map location. These values are applied directly to the
-        `~sunpy.map.GenericMap.reference_coordinate`. To check how much shift
-        has already been applied see `~sunpy.map.GenericMap.shifted_value`
+        `~sunpy.map.GenericMap.reference_coordinate`. To check how much the
+        reference coordinate has been modified, see
+        ``sunpy.map.GenericMap.meta.modified_items['CRVAL1']`` and
+        ``sunpy.map.GenericMap.meta.modified_items['CRVAL2']``.
 
         Parameters
         ----------
@@ -1012,9 +1058,6 @@ class GenericMap(NDData):
 
         # Create new map with the modification
         new_map = self._new_instance(self.data, new_meta, self.plot_settings)
-
-        new_map._shift = SpatialPair(self.shifted_value[0] + axis1,
-                                     self.shifted_value[1] + axis2)
 
         return new_map
 
@@ -1432,25 +1475,38 @@ class GenericMap(NDData):
 # #### I/O routines #### #
 
     def save(self, filepath, filetype='auto', **kwargs):
-        """Saves the SunPy Map object to a file.
-
-        Currently SunPy can only save files in the FITS format. In the future
-        support will be added for saving to other formats.
+        """
+        Save a map to a file.
 
         Parameters
         ----------
-        filepath : str
+        filepath : `str`
             Location to save file to.
-        filetype : str, optional
-            Any supported file extension, defaults to ``auto"``.
+        filetype : `str`, optional
+            Any supported file extension, defaults to ``"auto"``.
         hdu_type : `~astropy.io.fits.hdu.base.ExtensionHDU` instance or class, optional
             By default, a FITS file is written with the map in its primary HDU.
             If a type is given, a new HDU of this type will be created.
             If a HDU instance is given, its data and header will be updated from the map.
             Then that HDU instance will be written to the file.
+            The example below uses `astropy.io.fits.CompImageHDU` to compress the map.
         kwargs :
             Any additional keyword arguments are passed to
             `~sunpy.io.write_file`.
+
+        Notes
+        -----
+        Saving with the jp2 extension will write a modified version
+        of the given data casted to uint8 values in order to support
+        the JPEG2000 format.
+
+        Examples
+        --------
+        >>> from astropy.io.fits import CompImageHDU
+        >>> from sunpy.map import Map
+        >>> import sunpy.data.sample  # doctest: +REMOTE_DATA
+        >>> aia_map = Map(sunpy.data.sample.AIA_171_IMAGE)  # doctest: +REMOTE_DATA
+        >>> aia_map.save("aia171.fits", hdu_type=CompImageHDU)  # doctest: +REMOTE_DATA
         """
         io.write_file(filepath, self.data, self.meta, filetype=filetype,
                       **kwargs)
@@ -1531,21 +1587,17 @@ class GenericMap(NDData):
         new_map = self._new_instance(new_data, new_meta, self.plot_settings)
         return new_map
 
+    @add_common_docstring(rotation_function_names=_rotation_function_names)
     @u.quantity_input
-    def rotate(self, angle: u.deg = None, rmatrix=None, order=4, scale=1.0,
-               recenter=False, missing=0.0, use_scipy=None, *, method='skimage'):
+    def rotate(self, angle: u.deg = None, rmatrix=None, order=3, scale=1.0,
+               recenter=False, missing=np.nan, use_scipy=None, *, method='scipy', clip=True):
         """
         Returns a new rotated and rescaled map.
 
         Specify either a rotation angle or a rotation matrix, but not both. If
         neither an angle or a rotation matrix are specified, the map will be
-        rotated by the rotation angle in the metadata.
-
-        The map will be rotated around the reference coordinate defined in the
-        meta data.
-
-        This method also updates the ``rotation_matrix`` attribute and any
-        appropriate header data so that they correctly describe the new map.
+        rotated by the rotation information in the metadata, which should derotate
+        the map so that the pixel axes are aligned with world-coordinate axes.
 
         Parameters
         ----------
@@ -1554,27 +1606,24 @@ class GenericMap(NDData):
         rmatrix : array-like
             2x2 linear transformation rotation matrix.
         order : int
-            Interpolation order to be used. Must be in the range 0-5.
-            When using scikit-image this
-            parameter is passed into :func:`skimage.transform.warp` (e.g., 4
-            corresponds to bi-quartic interpolation).
-            When using scipy it is passed into
-            :func:`scipy.ndimage.affine_transform` where it
-            controls the order of the spline. Faster performance may be
-            obtained at the cost of accuracy by using lower values.
-            Default: 4
+            Interpolation order to be used.  The precise meaning depends on the
+            rotation method specified by ``method``.
+            Default: 3
         scale : float
             A scale factor for the image, default is no scaling
         recenter : bool
-            If True, position the axis of rotation at the center of the new map
-            Default: False
+            If `True`, position the reference coordinate at the center of the new map
+            Default: `False`
         missing : float
-            The numerical value to fill any missing points after rotation.
-            Default: 0.0
-        method : {``'skimage'``, ``'scipy'``}, optional
-            Rotation function to use. Currently
-            :func:`scipy.ndimage.affine_transform` and
-            :func:`skimage.transform.warp` are supported.
+            The value to use for pixels in the output map that are beyond the extent
+            of the input map.
+            Default: `numpy.nan`
+        method : {{{rotation_function_names}}}, optional
+            Rotation function to use.  Defaults to ``'scipy'``.
+        clip : `bool`, optional
+            If `True`, clips the pixel values of the output image to the range of the
+            input image (including the value of ``missing``, if used).
+            Defaults to `True`.
 
         Returns
         -------
@@ -1589,16 +1638,25 @@ class GenericMap(NDData):
 
         Notes
         -----
-        This function will remove old CROTA keywords from the header.
-        This function will also convert a CDi_j matrix to a PCi_j matrix.
+        The rotation information in the metadata of the new map is modified
+        appropriately from that of the original map to account for the applied rotation.
+        It will solely be in the form of a PCi_j matrix, even if the original map used
+        the CROTA2 keyword or a CDi_j matrix.
 
-        See :func:`sunpy.image.transform.affine_transform` for details on the
-        transformations, situations when the underlying data is modified prior
-        to rotation, and differences from IDL's rot().
+        If the map does not already contain pixels with `numpy.nan` values, setting
+        ``missing`` to an appropriate number for the data (e.g., zero) will reduce the
+        computation time.
+
+        For each NaN pixel in the input image, one or more pixels in the output image
+        will be set to NaN, with the size of the pixel region affected depending on the
+        interpolation order.  All currently implemented rotation methods require a
+        convolution step to handle image NaNs.  This convolution normally uses
+        :func:`scipy.signal.convolve2d`, but if `OpenCV <https://opencv.org>`__ is
+        installed, the faster |cv2_filter2D|_ is used instead.
+
+        See :func:`sunpy.image.transform.affine_transform` for details on each of the
+        rotation functions.
         """
-        # Put the import here to reduce sunpy.map import time
-        from sunpy.image.transform import _get_transform_method, affine_transform
-
         if angle is not None and rmatrix is not None:
             raise ValueError("You cannot specify both an angle and a rotation matrix.")
         elif angle is None and rmatrix is None:
@@ -1669,7 +1727,7 @@ class GenericMap(NDData):
                                     order=order, scale=scale,
                                     image_center=pixel_center,
                                     recenter=recenter, missing=missing,
-                                    method=method)
+                                    method=method, clip=clip)
 
         if recenter:
             new_reference_pixel = pixel_array_center
@@ -2064,7 +2122,8 @@ class GenericMap(NDData):
         return cmap
 
     @u.quantity_input
-    def draw_grid(self, axes=None, grid_spacing: u.deg = 15*u.deg, annotate=True, **kwargs):
+    def draw_grid(self, axes=None, grid_spacing: u.deg = 15*u.deg, annotate=True,
+                  system='stonyhurst', **kwargs):
         """
         Draws a coordinate overlay on the plot in the Heliographic Stonyhurst
         coordinate system.
@@ -2081,6 +2140,10 @@ class GenericMap(NDData):
             (lon, lat) spacing.
         annotate : `bool`
             Passing `False` disables the axes labels and the ticks on the top and right axes.
+        system : str
+            Coordinate system for the grid. Must be 'stonyhurst' or 'carrington'.
+        kwargs :
+            Additional keyword arguments are passed to `~sunpy.visualization.wcsaxes_compat.wcsaxes_heliographic_overlay`.
 
         Returns
         -------
@@ -2097,6 +2160,8 @@ class GenericMap(NDData):
                                                            annotate=annotate,
                                                            obstime=self.date,
                                                            rsun=self.rsun_meters,
+                                                           observer=self.observer_coordinate,
+                                                           system=system,
                                                            **kwargs)
 
     def draw_limb(self, axes=None, *, resolution=1000, **kwargs):
@@ -2149,17 +2214,18 @@ class GenericMap(NDData):
         # even if the image is rotated relative to the axes
         if not axes:
             axes = wcsaxes_compat.gca_wcs(self.wcs)
-        is_wcsaxes = wcsaxes_compat.is_wcsaxes(axes)
 
+        is_wcsaxes = wcsaxes_compat.is_wcsaxes(axes)
         if is_wcsaxes:
             # TODO: supply custom limb radius
             return sunpy.visualization.limb.draw_limb(
                 axes, self.observer_coordinate, resolution=resolution,
                 rsun=self.rsun_meters, **kwargs)
         else:
+            warn_deprecated("Drawing the limb on a non-WCS Axes is deprecated, "
+                            "and will be removed in sunpy 4.1.")
             # If not WCSAxes use a Circle
             c_kw.setdefault('radius', self.rsun_obs.value)
-
             circ = patches.Circle([0, 0], **c_kw)
             axes.add_artist(circ)
             return circ, None
@@ -2301,7 +2367,7 @@ class GenericMap(NDData):
         # Transform the indices if plotting to a different WCS
         # We do this instead of using the `transform` keyword argument so that Matplotlib does not
         # get confused about the bounds of the contours
-        if wcsaxes_compat.is_wcsaxes(axes) and self.wcs is not axes.wcs:
+        if self.wcs is not axes.wcs:
             transform = axes.get_transform(self.wcs) - axes.transData  # pixel->pixel transform
             x_1d, y_1d = transform.transform(np.stack([x.ravel(), y.ravel()]).T).T
             x, y = np.reshape(x_1d, x.shape), np.reshape(y_1d, y.shape)
@@ -2445,26 +2511,15 @@ class GenericMap(NDData):
             if title:
                 axes.set_title(title)
 
-            if wcsaxes_compat.is_wcsaxes(axes):
-                # WCSAxes has unit identifiers on the tick labels, so no need
-                # to add unit information to the label
-                spatial_units = [None, None]
-                ctype = axes.wcs.wcs.ctype
-            else:
-                spatial_units = self.spatial_units
-                ctype = self.coordinate_system
+            # WCSAxes has unit identifiers on the tick labels, so no need
+            # to add unit information to the label
+            spatial_units = [None, None]
+            ctype = axes.wcs.wcs.ctype
 
             axes.set_xlabel(axis_labels_from_ctype(ctype[0],
                                                    spatial_units[0]))
             axes.set_ylabel(axis_labels_from_ctype(ctype[1],
                                                    spatial_units[1]))
-
-        if not wcsaxes_compat.is_wcsaxes(axes):
-            bl = self._get_lon_lat(self.bottom_left_coord)
-            tr = self._get_lon_lat(self.top_right_coord)
-            x_range = list(u.Quantity([bl[0], tr[0]]).to(self.spatial_units[0]).value)
-            y_range = list(u.Quantity([bl[1], tr[1]]).to(self.spatial_units[1]).value)
-            imshow_args.update({'extent': x_range + y_range})
 
         # Take a deep copy here so that a norm in imshow_kwargs doesn't get modified
         # by setting it's vmin and vmax
@@ -2513,8 +2568,7 @@ class GenericMap(NDData):
                 if item in imshow_args:
                     del imshow_args[item]
 
-            if wcsaxes_compat.is_wcsaxes(axes):
-                imshow_args.setdefault('transform', axes.get_transform(self.wcs))
+            imshow_args.setdefault('transform', axes.get_transform(self.wcs))
 
             # The quadrilaterals of pcolormesh can slightly overlap, which creates the appearance
             # of a grid pattern when alpha is not 1.  These settings minimize the overlap.
@@ -2526,8 +2580,7 @@ class GenericMap(NDData):
         else:
             ret = axes.imshow(data, **imshow_args)
 
-        if wcsaxes_compat.is_wcsaxes(axes):
-            wcsaxes_compat.default_wcs_grid(axes)
+        wcsaxes_compat.default_wcs_grid(axes)
 
         # Set current axes/image if pyplot is being used (makes colorbar work)
         for i in plt.get_fignums():
@@ -2693,24 +2746,9 @@ class GenericMap(NDData):
 
 
 GenericMap.__doc__ += textwrap.indent(_notes_doc, "    ")
+GenericMap.shift.__doc__ = GenericMap.shift_reference_coord.__doc__
 
 
 class InvalidHeaderInformation(ValueError):
     """Exception to raise when an invalid header tag value is encountered for a
     FITS/JPEG 2000 file."""
-
-
-def _figure_to_base64(fig):
-    # Converts a matplotlib Figure to a base64 UTF-8 string
-    buf = BytesIO()
-    fig.savefig(buf, format='png', facecolor='none')  # works better than transparent=True
-    return b64encode(buf.getvalue()).decode('utf-8')
-
-
-def _modify_polygon_visibility(polygon, keep):
-    # Put import here to reduce sunpy.map import time
-    from matplotlib.path import Path
-
-    polygon_codes = polygon.get_path().codes
-    polygon_codes[:-1][~keep] = Path.MOVETO
-    polygon_codes[-1] = Path.MOVETO if not keep[0] else Path.LINETO

@@ -3,14 +3,22 @@ This module provies `sunpy.timeseries.GenericTimeSeries` which all other
 `sunpy.timeseries.TimeSeries` classes inherit from.
 """
 import copy
+import html
+import time
+import textwrap
+import webbrowser
+from tempfile import NamedTemporaryFile
 from collections import OrderedDict
 from collections.abc import Iterable
 
+import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 
 import astropy
 import astropy.units as u
 from astropy.table import Column, Table
+from astropy.visualization import hist
 
 from sunpy import config
 from sunpy.time import TimeRange
@@ -18,6 +26,7 @@ from sunpy.timeseries import TimeSeriesMetaData
 from sunpy.util.datatype_factory_base import NoMatchError
 from sunpy.util.exceptions import warn_user
 from sunpy.util.metadata import MetaDict
+from sunpy.util.util import _figure_to_base64
 from sunpy.visualization import peek_show
 
 # define and register a new unit, needed for RHESSI
@@ -35,8 +44,8 @@ class GenericTimeSeries:
 
     Parameters
     ----------
-    data : `~pandas.DataFrame`
-        A `pandas.DataFrame` representing one or more fields as a function of time.
+    data : `~pandas.DataFrame` or `numpy.array`
+        A `pandas.DataFrame` or `numpy.array` representing one or more fields as a function of time.
     meta : `~sunpy.timeseries.metadata.TimeSeriesMetaData`, optional
         The metadata giving details about the time series data/instrument.
         Defaults to `None`.
@@ -74,6 +83,9 @@ class GenericTimeSeries:
     # Class attribute used to specify the source class of the TimeSeries.
     _source = None
     _registry = dict()
+
+    # Title to show when .peek()ing
+    _peek_title = ''
 
     def __init_subclass__(cls, **kwargs):
         """
@@ -183,7 +195,220 @@ class GenericTimeSeries:
         else:
             return None
 
+    @property
+    def url(self):
+        """
+        URL to the mission website.
+        """
+        return self._url
+
 # #### Data Access, Selection and Organisation Methods #### #
+
+    def _text_summary(self):
+        """
+        Produces a table summary of the timeseries data to be passed to
+        the _repr_html_ function.
+        """
+        obs = self.observatory
+        if obs is None:
+            try:
+                obs = self.meta.metadata[0][2]["telescop"]
+            except KeyError:
+                obs = "Unknown"
+        try:
+            inst = self.meta.metadata[0][2]["instrume"]
+        except KeyError:
+            inst = "Unknown"
+        try:
+            link = f"""<a href={self.url} target="_blank">{inst}</a>"""
+        except AttributeError:
+            link = inst
+        dat = self.to_dataframe()
+        drange = dat.max() - dat.min()
+        drange = drange.to_string(float_format="{:.2E}".format)
+        drange = drange.replace("\n", "<br>")
+
+        center = self.time_range.center.value.astype('datetime64[s]')
+        center = str(center).replace("T", " ")
+        resolution = round(self.time_range.seconds.value/self.shape[0], 3)
+        resolution = str(resolution)+" s"
+
+        channels = self.columns
+        channels = "<br>".join(channels)
+
+        uni = list(set(self.units.values()))
+        uni = [x.unit if type(x) == u.quantity.Quantity else x for x in uni]
+        uni = ["dimensionless" if x == u.dimensionless_unscaled else x for x in uni]
+        uni = "<br>".join(str(x) for x in uni)
+
+        return textwrap.dedent(f"""\
+                   SunPy TimeSeries
+                   ----------------
+                   Observatory:\t\t {obs}
+                   Instrument:\t\t {link}
+                   Channel(s):\t\t {channels}
+                   Start Date:\t\t {dat.index.min().round('s')}
+                   End Date:\t\t {dat.index.max().round('s')}
+                   Center Date:\t\t {center}
+                   Resolution:\t\t {resolution}
+                   Samples per Channel:\t\t {self.shape[0]}
+                   Data Range(s):\t\t {drange}
+                   Units:\t\t {uni}""")
+
+    def __str__(self):
+        return f"{self._text_summary()}\n{self._data.__repr__()}"
+
+    def __repr__(self):
+        return f"{object.__repr__(self)}\n{self}"
+
+    def _repr_html_(self):
+        """
+        Produces an HTML summary of the timeseries data with plots for use in
+        Jupyter notebooks.
+        """
+        # Call _text_summary and reformat as an HTML table
+        partial_html = (
+            self._text_summary()[34:]
+            .replace("\n", "</td></tr><tr><th>")
+            .replace(":\t", "</th><td>")
+        )
+        text_to_table = (
+            f"""\
+            <table style='text-align:left'>
+                <tr><th>{partial_html}</td></tr>
+            </table>"""
+        ).replace("\n", "")
+
+        # Create the timeseries plots for each channel as a panel in one
+        # figure. The color list below is passed to both timeseries and
+        # histogram plotting methods for consistency.
+        cols = ['b', 'g', 'r', 'c', 'm', 'y', 'tab:blue', 'tab:orange',
+                'tab:red', 'tab:purple', 'tab:brown', 'tab:pink', 'tab:gray',
+                'tab:green', 'tab:olive', 'tab:cyan', 'palegreen', 'pink'
+                ]
+        dat = self.to_dataframe()
+        fig, axs = plt.subplots(
+            nrows=len(self.columns),
+            ncols=1,
+            sharex=True,
+            constrained_layout=True,
+            figsize=(6, 10),
+        )
+        # If all channels have the same unit, then one shared y-axis
+        # label is set. Otherwise, each subplot has its own yaxis label.
+        for i in range(len(self.columns)):
+            if len(self.columns) == 1:
+                axs.plot(
+                    dat.index,
+                    dat[self.columns[i]].values,
+                    color=cols[i],
+                    label=self.columns[i],
+                )
+                if (dat[self.columns[i]].values < 0).any() is np.bool_(False):
+                    axs.set_yscale("log")
+                axs.legend(frameon=False, handlelength=0)
+                axs.set_ylabel(self.units[self.columns[i]])
+            else:
+                axs[i].plot(
+                    dat.index,
+                    dat[self.columns[i]].values,
+                    color=cols[i],
+                    label=self.columns[i],
+                )
+                if (dat[self.columns[i]].values < 0).any() is np.bool_(False):
+                    axs[i].set_yscale("log")
+                axs[i].legend(frameon=False, handlelength=0)
+                axs[i].set_ylabel(self.units[self.columns[i]])
+        plt.xticks(rotation=30)
+        spc = _figure_to_base64(fig)
+        plt.close(fig)
+        # Make histograms for each column of data. The histograms are
+        # created using the Astropy hist method that uses Scott's rule
+        # for bin sizes.
+        hlist = []
+        for i in range(len(dat.columns)):
+            if set(np.isnan(dat[self.columns[i]].values)) != {True}:
+                fig = plt.figure(figsize=(5, 3), constrained_layout=True)
+                hist(
+                    dat[self.columns[i]].values[~np.isnan(dat[self.columns[i]].values)],
+                    log=True,
+                    bins="scott",
+                    color=cols[i],
+                )
+                plt.title(self.columns[i] + " [click for other channels]")
+                plt.xlabel(self.units[self.columns[i]])
+                plt.ylabel("# of occurences")
+                hlist.append(_figure_to_base64(fig))
+                plt.close(fig)
+
+        # This loop creates a formatted list of base64 images that is passed
+        # directly into the JS script below, so all images are written into
+        # the html page when it is created (allows for an arbitrary number of
+        # histograms to be rotated through onclick).
+        hlist2 = []
+        for i in range(len(hlist)):
+            hlist2.append(f"data:image/png;base64,{hlist[i]}")
+
+        # The code below creates unique names to be passed to the JS script
+        # in the html code. Otherwise, multiple timeseries summaries will
+        # conflict in a single notebook.
+        source = str(self.source) + str(time.perf_counter_ns())
+
+        return textwrap.dedent(f"""\
+            <pre>{html.escape(object.__repr__(self))}</pre>
+            <script type="text/javascript">
+            function ImageChange(images) {{
+                this.images = images;
+                this.i = 0;
+                this.next = function(img) {{
+                    this.i++;
+                    if (this.i == images.length)
+                    this.i = 0;
+                    img.src = images[this.i];
+                }}
+            }}
+            var {source} = new ImageChange({hlist2});
+            </script>
+            <table>
+                <tr>
+                    <td style='width:40%'>{text_to_table}</td>
+                    <td rowspan=3>
+                        <img src='data:image/png;base64,{spc}'/>
+                    </td>
+                </tr>
+                <tr>
+                </tr>
+                <tr>
+                    <td>
+                    <img src="{hlist2[0]}" alt="Click here for histograms"
+                         onclick="{source}.next(this)"/>
+                    </td>
+                </tr>
+            </table>""")
+
+    def quicklook(self):
+        """
+        Display a quicklook summary of the Timeseries instance in the default
+        webbrowser.
+
+        Example
+        -------
+        >>> from sunpy.timeseries import TimeSeries
+        >>> import sunpy.data.sample  # doctest: +REMOTE_DATA
+        >>> goes_lc = TimeSeries(sunpy.data.sample.GOES_XRS_TIMESERIES)  # doctest: +REMOTE_DATA
+        >>> goes_lc.quicklook()  # doctest: +SKIP
+        """
+        with NamedTemporaryFile(
+            "w", delete=False, prefix="sunpy.timeseries.", suffix=".html"
+        ) as f:
+            url = "file://" + f.name
+            f.write(textwrap.dedent(f"""\
+                <html>
+                    <title>Quicklook summary for {html.escape(object.__repr__(self))}</title>
+                    <body>{self._repr_html_()}</body>
+                </html>""")
+                    )
+        webbrowser.open_new_tab(url)
 
     def quantity(self, colname, **kwargs):
         """
@@ -234,7 +459,7 @@ class GenericTimeSeries:
         units = copy.copy(self.units)
 
         # Add the unit to the units dictionary if already there.
-        if not (colname in self._data.columns):
+        if not (colname in self.columns):
             units[colname] = unit
 
         # Convert the given quantity into values for given units if necessary.
@@ -243,7 +468,7 @@ class GenericTimeSeries:
             values = values.to(units[colname]).value
 
         # Update or add the data.
-        if not (colname in self._data.columns) or overwrite:
+        if not (colname in self.columns) or overwrite:
             data[colname] = values
 
         # Return a new TimeSeries with the given updated/added column.
@@ -477,14 +702,7 @@ class GenericTimeSeries:
         `~matplotlib.axes.Axes`
             The plot axes.
         """
-        import matplotlib.pyplot as plt
-
-        # Get current axes
-        if axes is None:
-            axes = plt.gca()
-
-        if columns is None:
-            columns = self._data.columns
+        axes, columns = self._setup_axes_columns(axes, columns)
 
         axes = self._data[columns].plot(ax=axes, **plot_args)
 
@@ -494,10 +712,46 @@ class GenericTimeSeries:
             # label to the y-axis.
             unit = u.Unit(list(units)[0])
             axes.set_ylabel(unit.to_string())
+
+        self._setup_x_axis(axes)
         return axes
 
+    def _setup_axes_columns(self, axes, columns, *, subplots=False):
+        """
+        Validate data for plotting, and get default axes/columns if not passed
+        by the user.
+        """
+        import matplotlib.pyplot as plt
+
+        self._validate_data_for_plotting()
+        if columns is None:
+            columns = self.columns
+        if axes is None:
+            if not subplots:
+                axes = plt.gca()
+            else:
+                axes = plt.gcf().subplots(ncols=1, nrows=len(columns), sharex=True)
+
+        return axes, columns
+
+    @staticmethod
+    def _setup_x_axis(ax):
+        """
+        Shared code to set x-axis properties.
+        """
+        import matplotlib.dates as mdates
+        if isinstance(ax, np.ndarray):
+            ax = ax[-1]
+
+        locator = ax.xaxis.get_major_locator()
+        formatter = ax.xaxis.get_major_formatter()
+        if isinstance(formatter, mdates.AutoDateFormatter):
+            # Override Matplotlib default date formatter (concise one is better)
+            # but don't override any formatters pandas might have set
+            ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+
     @peek_show
-    def peek(self, columns=None, **kwargs):
+    def peek(self, columns=None, *, title=None, **kwargs):
         """
         Displays a graphical overview of the data in this object for user evaluation.
         For the creation of plots, users should instead use the
@@ -507,17 +761,19 @@ class GenericTimeSeries:
         ----------
         columns : list[str], optional
             If provided, only plot the specified columns.
+        title : str, optional
+            If provided, set the plot title. Custom timeseries sources may set
+            a default value for this.
         **kwargs : `dict`
             Any additional plot arguments that should be used when plotting.
         """
         import matplotlib.pyplot as plt
 
-        # Check we have a timeseries valid for plotting
-        self._validate_data_for_plotting()
-
         # Now make the plot
         figure = plt.figure()
         self.plot(columns=columns, **kwargs)
+        title = title or self._peek_title
+        figure.suptitle(title)
 
         return figure
 

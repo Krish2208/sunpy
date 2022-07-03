@@ -1,7 +1,6 @@
 #
 # Testing functions for a mapsequence solar derotation functionality.
 #
-import os
 from copy import deepcopy
 
 import numpy as np
@@ -12,15 +11,11 @@ import astropy.units as u
 from astropy.coordinates import SkyCoord
 from astropy.tests.helper import assert_quantity_allclose
 
-import sunpy.data.test
 import sunpy.map
 from sunpy.physics.solar_rotation import calculate_solar_rotate_shift, mapsequence_solar_derotate
 
-
-@pytest.fixture
-def aia171_test_map():
-    testpath = sunpy.data.test.rootdir
-    return sunpy.map.Map(os.path.join(testpath, 'aia_171_level1.fits'))
+DEP_WARNING = r'''ignore:The {} function is deprecated and may be removed in version 4.1.
+\s+Use `sunkit_image.coalignment.{}` instead.:sunpy.util.exceptions.SunpyDeprecationWarning'''
 
 
 @pytest.fixture
@@ -54,6 +49,9 @@ def known_displacements_layer_index1():
             'y': np.asarray([-0.263369, 0., 0.251137])}
 
 
+@pytest.mark.filterwarnings(DEP_WARNING.format(
+    'calculate_solar_rotate_shift', 'calculate_solar_rotate_shift'
+))
 def test_calculate_solar_rotate_shift(aia171_test_mapsequence, known_displacements_layer_index0, known_displacements_layer_index1):
     # Test that the default works
     test_output = calculate_solar_rotate_shift(aia171_test_mapsequence)
@@ -72,6 +70,12 @@ def test_calculate_solar_rotate_shift(aia171_test_mapsequence, known_displacemen
                     known_displacements_layer_index1['y'], rtol=5e-2, atol=1e-5)
 
 
+@pytest.mark.filterwarnings(DEP_WARNING.format(
+    'calculate_solar_rotate_shift', 'calculate_solar_rotate_shift'
+))
+@pytest.mark.filterwarnings(DEP_WARNING.format(
+    'mapsequence_solar_derotate', 'mapsequence_coalign_by_rotation'
+))
 def test_mapsequence_solar_derotate(aia171_test_mapsequence, aia171_test_submap):
     # Test that a mapsequence is returned when the clipping is False.
     tmc = mapsequence_solar_derotate(aia171_test_mapsequence, clip=False)

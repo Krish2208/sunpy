@@ -48,15 +48,15 @@ skip_glymur = pytest.mark.skipif(SKIP_GLYMUR, reason="Glymur can not be imported
 skip_ana = pytest.mark.skipif(SKIP_ANA, reason="ANA is not available.")
 if Version(python_version()) >= Version("3.10.0"):
     asdf_entry_points = pytest.mark.skipif(
-        not entry_points().select(group="asdf_extensions", name="sunpy"),
+        not entry_points().select(group="asdf.resource_mappings", name="sunpy"),
         reason="No SunPy ASDF entry points.",
     )
 else:
     asdf_entry_points = pytest.mark.skipif(
-        not all(
+        not any(
             [
                 enter_point.name == "sunpy"
-                for enter_point in entry_points()["asdf_extensions"]
+                for enter_point in entry_points()["asdf.resource_mappings"]
             ]
         ),
         reason="No SunPy ASDF entry points.",
